@@ -24,7 +24,7 @@ from .agent import Agent
 from .ax_tree import AXElement
 from .browser import Browser
 from .llm import LLM, DEFAULT_MODEL
-from .recipe import Recipe
+from .recipe import Engine, Recipe, RecipeFailure
 from .recorder import RecordingBrowser
 from .registry import SiteRegistry
 
@@ -142,6 +142,9 @@ class ToolProposal:
     parameters: dict
     tool_type: str  # "action" or "extract"
     start_url: str
+    # param name -> realistic example value. Used at RECORD time only, so
+    # autocomplete/typeahead fields surface real suggestions while we record.
+    examples: dict = field(default_factory=dict)
 
 
 _PROPOSE_SYSTEM = """\
@@ -159,7 +162,9 @@ Output JSON of the form:
       "start_url": "URL the tool starts from",
       "parameters": {
         "type": "object",
-        "properties": { "param1": {"type": "string", "description": "..."} },
+        "properties": {
+          "param1": {"type": "string", "description": "...", "example": "a realistic value"}
+        },
         "required": ["param1"]
       }
     }
@@ -167,11 +172,20 @@ Output JSON of the form:
 }
 
 Rules:
-- "action" tools perform some interaction (submit a form, click a button, etc.).
-- "extract" tools just READ data from a page (top stories, article facts, ...).
+- "action" tools perform some interaction (fill a form, search, book, etc.).
+  An action tool may chain SEVERAL steps (type into multiple fields, pick
+  autocomplete suggestions, click a button) and may also return data from
+  the page it lands on (e.g. search results). Use "action" — not "extract" —
+  whenever fields must be filled before the useful data appears.
+- "extract" tools just READ data from a page that is already showing it
+  (top stories, article facts, ...) with no interaction needed.
 - Reuse names visible in the page (e.g. "submit_contact_form" if the page has a Contact form).
 - For "action" tools, the parameters should map 1:1 to the input fields you saw.
 - For "extract" tools, include parameters like `n` (limit) or `query` (search term) if relevant.
+- Every parameter MUST include an "example": a realistic value that will be
+  typed during recording. For autocomplete/typeahead fields (airports, cities,
+  products) the example MUST be a real value that produces live suggestions
+  (e.g. "TLV", "New York") — never a placeholder token like "xxx".
 - Prefer fewer, higher-value tools over many similar ones.
 - Keep names short (1-3 words snake_case) and descriptions one sentence.
 """
@@ -195,13 +209,21 @@ def propose_tools(llm: LLM, survey: SiteSurvey) -> list[ToolProposal]:
 
     proposals: list[ToolProposal] = []
     for t in parsed.get("tools", []):
+        params = t.get("parameters") or {"type": "object", "properties": {}}
+        # Pull the per-param "example" out of the JSON Schema (it's a record-time
+        # hint, not part of the runtime contract) and keep it on the proposal.
+        examples: dict[str, str] = {}
+        for pname, pdef in (params.get("properties") or {}).items():
+            if isinstance(pdef, dict) and pdef.get("example") is not None:
+                examples[pname] = str(pdef.pop("example"))
         proposals.append(
             ToolProposal(
                 name=t.get("name", "tool"),
                 description=t.get("description", ""),
-                parameters=t.get("parameters") or {"type": "object", "properties": {}},
+                parameters=params,
                 tool_type=t.get("tool_type", "action"),
                 start_url=t.get("start_url") or survey.base_url,
+                examples=examples,
             )
         )
     return proposals
@@ -258,12 +280,18 @@ def approve_proposals(
 # ---------------------------------------------------------------- record
 
 def _placeholders_for(proposal: ToolProposal) -> dict[str, str]:
-    """Sentinel strings for each parameter."""
+    """Per-parameter value typed during recording.
+
+    Prefer the LLM-supplied realistic example so autocomplete fields surface
+    live suggestions; fall back to sentinels for plain fields with no example.
+    """
     out: dict[str, str] = {}
     for pname, pdef in (proposal.parameters.get("properties") or {}).items():
         ptype = (pdef or {}).get("type", "string")
-        # Build a per-param sentinel that doesn't collide with real text.
-        if ptype == "integer" or ptype == "number":
+        example = proposal.examples.get(pname)
+        if example:
+            out[pname] = example
+        elif ptype == "integer" or ptype == "number":
             out[pname] = "424242"  # unlikely-real-number sentinel
         elif (pdef or {}).get("enum"):
             # Use the first enum value as placeholder (must be valid for select).
@@ -273,37 +301,134 @@ def _placeholders_for(proposal: ToolProposal) -> dict[str, str]:
     return out
 
 
-def _synthetic_task(proposal: ToolProposal, placeholders: dict[str, str]) -> str:
+def _synthetic_task(
+    proposal: ToolProposal, placeholders: dict[str, str], hint: str = ""
+) -> str:
     bindings = "\n".join(f"  - {k}: {v!r}" for k, v in placeholders.items())
-    return (
+    task = (
         f"You are recording a recipe for the tool `{proposal.name}`: "
         f"{proposal.description}\n"
         f"Use these EXACT placeholder values when filling fields:\n{bindings}\n"
         f"Perform the action end-to-end (navigate, fill all relevant fields, "
-        f"submit). When the action is clearly complete, call done(success=true). "
+        f"submit). When you type into a field that pops up a dropdown of "
+        f"autocomplete suggestions (airports, cities, products), click the "
+        f"matching suggestion to commit it before moving to the next field. "
+        f"When the action is clearly complete and the result page is showing, "
+        f"call done(success=true). "
         f"Do not call extract during this recording — it isn't needed."
     )
+    if hint:
+        # Replay of the previous recording failed; steer the retry.
+        task += (
+            f"\n\nIMPORTANT: a previous attempt recorded steps that FAILED to "
+            f"replay deterministically — {hint}. Make sure to complete every "
+            f"required field and commit each dropdown selection so the flow "
+            f"reaches the result page."
+        )
+    return task
+
+
+_AUTOCOMPLETE_FIELD_ROLES = {"combobox", "searchbox", "textbox"}
+
+
+def _normalize_autocomplete(steps: list[dict]) -> list[dict]:
+    """Make recorded typeahead interactions parameter-independent.
+
+    During recording the agent types a realistic example (e.g. "TLV") into a
+    combobox and then clicks the suggestion the site offered — whose accessible
+    name is the site's canonical label ("Tel Aviv, Israel TLV"), NOT the typed
+    text. Replaying that literal click with a different argument ("JFK") would
+    fail. So whenever a parameterised `type` into a typeahead field is followed
+    by a click on a listbox `option`, we drop the captured option name and
+    replace the pair with: type {{param}} -> wait for an option -> click the
+    FIRST option. `resolve()` returns `.first`, so this picks the top suggestion
+    for whatever value is passed at call time.
+    """
+    out: list[dict] = []
+    i, n = 0, len(steps)
+    while i < n:
+        step = steps[i]
+        out.append(step)
+        is_param_type = (
+            step.get("op") == "type"
+            and (step.get("target") or {}).get("role") in _AUTOCOMPLETE_FIELD_ROLES
+            and "{{" in str(step.get("text", ""))
+        )
+        if is_param_type:
+            # Skip any settle waits the agent inserted, then look for the
+            # suggestion click it recorded.
+            j = i + 1
+            while j < n and steps[j].get("op") == "wait":
+                j += 1
+            if (
+                j < n
+                and steps[j].get("op") == "click"
+                and (steps[j].get("target") or {}).get("role") == "option"
+            ):
+                out.append({"op": "verify", "kind": "element_exists",
+                            "target": {"role": "option"}})
+                out.append({"op": "click", "target": {"role": "option"}})
+                i = j + 1
+                continue
+        i += 1
+    return out
+
+
+def _generate_extract_expr(proposal: ToolProposal, llm: LLM, obs) -> str:
+    """Ask the LLM for a JS extraction expression for the given page."""
+    user_msg = (
+        f"Tool: {proposal.name}\n"
+        f"Description: {proposal.description}\n"
+        f"Parameters JSON Schema: {json.dumps(proposal.parameters)}\n\n"
+        f"PAGE AT {obs.url}:\n{obs.text}\n"
+    )
+    resp = llm.client.chat.completions.create(
+        model=llm.model,
+        messages=[
+            {"role": "system", "content": _EXTRACT_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
+    )
+    raw = resp.choices[0].message.content or "{}"
+    try:
+        expr = json.loads(raw).get("js_expr", "")
+    except json.JSONDecodeError:
+        expr = ""
+    return expr.strip() or "() => ({ error: 'no expression generated' })"
 
 
 def record_action_recipe(
-    proposal: ToolProposal, llm: LLM, headless: bool = True
+    proposal: ToolProposal, llm: LLM, headless: bool = True, hint: str = ""
 ) -> Recipe:
     placeholders = _placeholders_for(proposal)
     rec_browser = RecordingBrowser(placeholders=placeholders, headless=headless)
 
+    extract_expr = ""
     with rec_browser:
         agent = Agent(browser=rec_browser, llm=llm, max_steps=20)
-        agent.run(task=_synthetic_task(proposal, placeholders), start_url=proposal.start_url)
+        agent.run(task=_synthetic_task(proposal, placeholders, hint), start_url=proposal.start_url)
+        # After the action lands on its result page, capture an extraction
+        # expression so multi-step tools (search, booking lookup) return data.
+        try:
+            obs = rec_browser.observe()
+            extract_expr = _generate_extract_expr(proposal, llm, obs)
+        except Exception as e:
+            _console.print(f"    [yellow]extract step skipped: {e}[/]")
 
-    steps = list(rec_browser.steps)
-    # Final settle + verification step (best-effort).
+    steps = _normalize_autocomplete(list(rec_browser.steps))
+    # Final settle before reading the page.
     steps.append({"op": "wait", "ms": 1200})
+    returns: dict = {}
+    if extract_expr:
+        steps.append({"op": "js_extract", "expr": extract_expr, "key": "result"})
+        returns = {"result": "object|array"}
     return Recipe(
         name=proposal.name,
         description=proposal.description,
         parameters=proposal.parameters,
         steps=steps,
-        returns={},
+        returns=returns,
     )
 
 
@@ -330,26 +455,7 @@ def record_extract_recipe(
     # Visit the starting URL once so the LLM sees the actual structure.
     browser.goto(proposal.start_url)
     obs = browser.observe()
-    user_msg = (
-        f"Tool: {proposal.name}\n"
-        f"Description: {proposal.description}\n"
-        f"Parameters JSON Schema: {json.dumps(proposal.parameters)}\n\n"
-        f"PAGE AT {obs.url}:\n{obs.text}\n"
-    )
-    resp = llm.client.chat.completions.create(
-        model=llm.model,
-        messages=[
-            {"role": "system", "content": _EXTRACT_SYSTEM},
-            {"role": "user", "content": user_msg},
-        ],
-        response_format={"type": "json_object"},
-    )
-    raw = resp.choices[0].message.content or "{}"
-    try:
-        expr = json.loads(raw).get("js_expr", "")
-    except json.JSONDecodeError:
-        expr = ""
-    expr = expr.strip() or "() => ({ error: 'no expression generated' })"
+    expr = _generate_extract_expr(proposal, llm, obs)
 
     steps = [
         {"op": "goto", "url": proposal.start_url},
@@ -363,6 +469,56 @@ def record_extract_recipe(
         steps=steps,
         returns={"result": "object|array"},
     )
+
+
+# ------------------------------------------------------------ self-verify
+
+def _verify_replay(
+    recipe: Recipe, args: dict, headless: bool
+) -> tuple[bool, str]:
+    """Deterministically replay a freshly-recorded recipe to prove it works.
+
+    Runs the Engine (no LLM) in a clean browser with the example args. A
+    recipe is only trustworthy if it replays end-to-end — this is what lets
+    the mapper handle arbitrary multi-step flows instead of hoping the
+    recording was clean.
+    """
+    try:
+        with Browser(headless=headless) as b:
+            result = Engine(b).execute(recipe, args)
+        keys = ", ".join(result.keys()) if result else "(no extract)"
+        return True, f"replayed {len(recipe.steps)} steps -> {keys}"
+    except RecipeFailure as e:
+        return False, f"step {e.step_index}: {e.reason}"
+    except Exception as e:  # browser/launch errors, etc.
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _record_verified_action(
+    proposal: ToolProposal, llm: LLM, headless: bool, max_attempts: int = 2
+) -> Recipe:
+    """Record an action recipe, then replay-verify it; re-record on failure.
+
+    On a failed replay the failure reason is fed back to the recording agent
+    as a hint so the retry can fix the missing/raced step.
+    """
+    args = _placeholders_for(proposal)
+    hint = ""
+    recipe: Optional[Recipe] = None
+    for attempt in range(1, max_attempts + 1):
+        recipe = record_action_recipe(proposal, llm, headless=headless, hint=hint)
+        ok, msg = _verify_replay(recipe, args, headless)
+        if ok:
+            _console.print(f"    [green]replay check passed: {msg}[/]")
+            return recipe
+        _console.print(
+            f"    [yellow]replay check failed (attempt {attempt}/{max_attempts}): {msg}[/]"
+        )
+        hint = msg
+    _console.print(
+        "    [red]recipe still fails to replay — saved anyway; inspect/repair the steps.[/]"
+    )
+    return recipe  # last attempt; let the user see/fix it
 
 
 # ---------------------------------------------------------------- top-level
@@ -406,8 +562,13 @@ def map_site(
                 # Need an open browser for the LLM to see the page once.
                 with Browser(headless=headless) as b:
                     r = record_extract_recipe(p, llm, b)
+                ok, msg = _verify_replay(r, _placeholders_for(p), headless)
+                _console.print(
+                    f"    [{'green' if ok else 'yellow'}]replay check: {msg}[/]"
+                )
             else:
-                r = record_action_recipe(p, llm, headless=headless)
+                # Action recipes are recorded AND replay-verified (retry on fail).
+                r = _record_verified_action(p, llm, headless=headless)
             recipes.append(r)
             _console.print(
                 f"    -> {len(r.steps)} step(s) recorded"

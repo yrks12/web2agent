@@ -93,6 +93,16 @@ class Engine:
                 elif op == "press_enter":
                     loc = resolve(self.browser.page, Target.from_dict(step["target"]))
                     loc.press("Enter")
+                elif op == "press":
+                    # Generic key press. With a target, press the key on that
+                    # element; otherwise press it on whatever is focused. Used
+                    # for autocomplete commit sequences (ArrowDown, Enter).
+                    key = step.get("key", "Enter")
+                    if step.get("target"):
+                        loc = resolve(self.browser.page, Target.from_dict(step["target"]))
+                        loc.press(key)
+                    else:
+                        self.browser.press_key(key)
                 elif op == "select":
                     loc = resolve(self.browser.page, Target.from_dict(step["target"]))
                     value = step.get("value", "")

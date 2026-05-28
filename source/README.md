@@ -155,10 +155,32 @@ agentify/
 
 A Hebrew teaching page is at `docs/agentify.html`.
 
+## Multi-step flows (supported)
+
+The mapper records arbitrary **linear multi-step** flows for any site, with no
+per-site code, via four site-agnostic mechanisms:
+
+- **Realistic example inputs** — the proposer attaches an `example` to each
+  parameter (carried on `ToolProposal.examples`, used by `_placeholders_for`)
+  so typeaheads/live-search respond during recording.
+- **Autocomplete normalization** — `_normalize_autocomplete` rewrites
+  `type {{param}} into a combobox → click a named suggestion` into
+  `type {{param}} → verify an option exists → click the FIRST option`
+  (`{"role": "option"}` resolves to `.first`), which is parameter-independent.
+- **Auto result-extraction** — `record_action_recipe` appends a `js_extract`
+  of the landing page so action tools return data.
+- **Self-verifying record→replay** — `_record_verified_action` replays each
+  freshly recorded recipe with the example args (`_verify_replay`) and
+  re-records once with the failure as a hint if it doesn't replay.
+
+What's still missing are *non-linear* shapes (loops, branches) and a few
+binding edge cases — below.
+
 ## What this does NOT handle (and how you'd extend it)
 
-The current system works well for **single-form submissions** and
-**single-page data extraction**. Once you've internalised how it works,
+The current system works well for **single-form submissions**,
+**linear multi-step flows** (fill fields → pick suggestions → submit → read),
+and **single-page data extraction**. Once you've internalised how it works,
 these are the real seams where it falls over — listed with the concrete
 fix each one needs:
 
@@ -214,11 +236,17 @@ for it. That's why Wikipedia got `search_wikipedia` but not
 
 ### 5. Param binding fails on non-text actions
 When the Recorder sees `type_text(id=4, text="__W2A_EMAIL__")` it knows
-to bind that field to `{{email}}`. But for **clicks** on radio buttons,
-checkboxes, date pickers, file uploads — there's no typed text, so no
-sentinel to swap. Result: enum / boolean params get hardcoded to whatever
-the mapping agent picked (e.g. `pizza_size` was frozen to "Small" instead
-of `{{pizza_size}}`).
+to bind that field to `{{email}}`. Typeahead/autocomplete *is* handled now
+(see "Multi-step flows" above — the suggestion click is normalized to a
+parameter-independent first-option select). But for **clicks** on radio
+buttons, checkboxes, date pickers, file uploads — and for "open X by
+title" flows where the agent navigates by clicking a named link instead of
+typing — there's no typed text, so no sentinel to swap. Result: those
+params get hardcoded to whatever the mapping agent picked (e.g. `pizza_size`
+frozen to "Small" instead of `{{pizza_size}}`). Note the replay-verify pass
+can still *pass* such a recipe, because the hardcoded path works for the
+example value — so inspect recipes whose parameters drive a click rather
+than a type.
 
 - **Why it matters:** any form with selects, radios, checkboxes is
   partially parameterized.

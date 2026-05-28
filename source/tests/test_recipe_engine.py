@@ -66,6 +66,10 @@ class FakeBrowser:
         self.actions.append(("scroll", direction))
         return f"scrolled {direction}"
 
+    def press_key(self, key):
+        self.actions.append(("press_key", key))
+        return f"pressed {key}"
+
 
 def test_substitution_in_recipe_steps():
     browser = FakeBrowser()
@@ -130,3 +134,23 @@ def test_extract_stores_into_result():
     )
     result = Engine(browser).execute(recipe, {})
     assert result == {"title": "extracted-text"}
+
+
+def test_press_op_on_target():
+    browser = FakeBrowser()
+    recipe = Recipe(
+        name="t", description="", parameters={},
+        steps=[{"op": "press", "key": "ArrowDown", "target": {"role": "combobox"}}],
+    )
+    Engine(browser).execute(recipe, {})
+    assert browser.page.last_press == "ArrowDown"
+
+
+def test_press_op_without_target_uses_keyboard():
+    browser = FakeBrowser()
+    recipe = Recipe(
+        name="t", description="", parameters={},
+        steps=[{"op": "press", "key": "Enter"}],
+    )
+    Engine(browser).execute(recipe, {})
+    assert ("press_key", "Enter") in browser.actions

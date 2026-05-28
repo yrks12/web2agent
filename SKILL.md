@@ -21,7 +21,7 @@ The CLI's `_load_env` walks up from the package and finds `source/.env` automati
 
 ## Phase 1 — map a site (one-shot per site)
 
-Crawls the landing page, asks the LLM to propose tool functions, prompts you to accept/reject each one, then drives the site with sentinel placeholders to record a deterministic recipe per tool. Output is written to `~/.claude/skills/Agentify/source/recipes/<name>.tools.json`.
+Crawls the landing page, asks the LLM to propose tool functions, prompts you to accept/reject each one, then drives the site to record a deterministic recipe per tool. Output is written to `~/.claude/skills/Agentify/source/recipes/<name>.tools.json`.
 
 ```bash
 ~/.claude/skills/Agentify/venv/bin/python -m agentify.cli map \
@@ -32,6 +32,30 @@ Flags:
 - `--auto-approve` — skip the interactive accept/reject step
 - `--no-headless` — show the browser while recording
 - `--model gpt-4o-mini` — override `AGENTIFY_MODEL` from .env
+
+### Multi-step flows (any site, no per-site code)
+
+`map` records arbitrary linear multi-step flows — fill several fields, pick
+autocomplete suggestions, submit, read the result page — using four
+site-agnostic mechanisms:
+
+1. **Realistic example inputs.** The proposer supplies a real value per field
+   (`"TLV"`, not `"xxx"`), so dynamic widgets (typeaheads, live search) respond
+   while recording. Without this, dropdowns never open and the flow can't be
+   captured.
+2. **Autocomplete normalization.** Any `type into a combobox → click a
+   suggestion` is rewritten to "type `{{param}}` → wait for an option → click
+   the **first** option," which is input-independent and replays for any value.
+3. **Auto result-extraction.** Whatever page the flow lands on, the mapper
+   generates a `js_extract` so the tool returns data.
+4. **Self-verifying record→replay.** After the LLM records the steps, the
+   mapper deterministically replays the recipe with the example values to prove
+   it works; on failure it re-records once with the failure fed back as a hint.
+   The console prints a `replay check passed/failed` line per tool.
+
+Recording costs LLM calls once, at map time. Replay (`call`) is pure Playwright
+with **zero** LLM calls — typically a few seconds for a multi-step flow, versus
+an LLM round-trip per step in a general agentic browser.
 
 ## Phase 2a — call a single tool directly (no LLM)
 
@@ -62,7 +86,7 @@ Deterministic replay of a recorded recipe with explicit JSON args.
 
 ## Recipe shape (for reference)
 
-Each tool is `{name, description, parameters: JSON-Schema, steps: [...]}`. Step ops: `goto`, `click`, `type`, `select`, `press_enter`, `scroll`, `wait`, `extract`, `js_extract`, `verify`. Selectors try role+name → CSS → text in order.
+Each tool is `{name, description, parameters: JSON-Schema, steps: [...]}`. Step ops: `goto`, `click`, `type`, `select`, `press_enter`, `press`, `scroll`, `wait`, `extract`, `js_extract`, `verify`. Selectors try role+name → CSS → text in order; a target of `{"role": "option"}` resolves to the first match, which is how autocomplete suggestions are selected parameter-independently. `press` sends a key (e.g. `{"op": "press", "key": "Enter"}`) to a target, or to whatever is focused if no target is given.
 
 ## Updating the skill
 
