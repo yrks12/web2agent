@@ -53,7 +53,10 @@ def _substitute(value: Any, args: dict) -> Any:
     if isinstance(value, list):
         return [_substitute(v, args) for v in value]
     if isinstance(value, dict):
-        return {k: _substitute(v, args) for k, v in value.items()}
+        # `expr` is JS source for js_extract — args are passed natively via
+        # page.evaluate(expr, args), so we must NOT template into it (would be
+        # JS injection and would lose type information).
+        return {k: (v if k == "expr" else _substitute(v, args)) for k, v in value.items()}
     return value
 
 
@@ -122,8 +125,11 @@ class Engine:
                     returned[step["key"]] = val
                 elif op == "js_extract":
                     # Custom JS for tricky extraction. Deterministic — no LLM.
+                    # Parameters are passed natively as the second arg to
+                    # page.evaluate, bound to `args` inside an `(args) => {...}`
+                    # function. Legacy IIFE expressions ignore the extra arg.
                     expr = step["expr"]
-                    val = self.browser.page.evaluate(expr)
+                    val = self.browser.page.evaluate(expr, args)
                     returned[step["key"]] = val
                 elif op == "verify":
                     import time
